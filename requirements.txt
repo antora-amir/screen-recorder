@@ -1,0 +1,9 @@
+customtkinter>=5.2.2
+mss>=9.0.1
+numpy>=2.1
+opencv-python>=4.10
+sounddevice>=0.5
+soundfile>=0.12.1
+imageio-ffmpeg>=0.5
+Pillow>=11.0
+keyboard>=0.13.5
