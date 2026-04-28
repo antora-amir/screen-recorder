@@ -53,6 +53,10 @@ class ScreenRecorder:
 
         self._frame_count = 0
         self._is_recording = False
+        self._real_fps: float = 0.0
+        self._capture_ready = threading.Event()
+        self._video_capture_start: float = 0.0
+        self._video_capture_end: float = 0.0
 
     # ----- public API -----
     @property
@@ -83,8 +87,12 @@ class ScreenRecorder:
 
         self._stop_event.clear()
         self._pause_event.clear()
+        self._capture_ready.clear()
         self._frame_count = 0
         self._paused_accum = 0.0
+        self._video_capture_start = 0.0
+        self._video_capture_end = 0.0
+        self._real_fps = 0.0
         self._start_time = time.time()
         self._is_recording = True
 
@@ -115,13 +123,24 @@ class ScreenRecorder:
         if not self._is_recording:
             return ""
 
+        # Finalize pause duration if currently paused so timing is accurate.
+        if self._pause_event.is_set():
+            self._paused_accum += time.time() - self._pause_start
+            self._pause_event.clear()
+
         self._stop_event.set()
-        self._pause_event.clear()
 
         if self._video_thread:
-            self._video_thread.join(timeout=10)
+            self._video_thread.join(timeout=15)
         if self._audio_thread:
-            self._audio_thread.join(timeout=10)
+            self._audio_thread.join(timeout=15)
+
+        # Compute real (effective) FPS from frames actually written / active capture duration.
+        active = max(0.001, self._video_capture_end - self._video_capture_start - self._paused_accum)
+        if self._frame_count > 0:
+            self._real_fps = self._frame_count / active
+        else:
+            self._real_fps = float(self.config.fps)
 
         self._is_recording = False
         self.on_status("encoding")
@@ -159,10 +178,13 @@ class ScreenRecorder:
             writer = cv2.VideoWriter(self._video_tmp, fourcc, self.config.fps, (width, height))
             if not writer.isOpened():
                 self.on_status("error: could not open video writer")
+                self._capture_ready.set()
                 return
 
             frame_dt = 1.0 / self.config.fps
-            next_t = time.time()
+            self._video_capture_start = time.time()
+            next_t = self._video_capture_start
+            self._capture_ready.set()  # release audio thread to start in lockstep
 
             try:
                 while not self._stop_event.is_set():
@@ -185,9 +207,17 @@ class ScreenRecorder:
                     else:
                         next_t = time.time()
             finally:
+                self._video_capture_end = time.time()
                 writer.release()
 
     def _audio_loop(self) -> None:
+        # Wait until video has opened the writer and is about to capture frame 0.
+        # This keeps audio and video aligned at the start.
+        if not self._capture_ready.wait(timeout=5):
+            return
+        if self._stop_event.is_set():
+            return
+
         samplerate = 44100
         channels = 2
         q: "queue.Queue[np.ndarray]" = queue.Queue()
@@ -225,15 +255,23 @@ class ScreenRecorder:
         out = self.config.output_path
         has_audio = os.path.exists(self._audio_tmp) and os.path.getsize(self._audio_tmp) > 1024
 
-        cmd = [ffmpeg, "-y", "-i", self._video_tmp]
+        # Re-time the raw video using the actual measured capture FPS so playback
+        # duration matches wall-clock recording time. Without this the file's
+        # metadata claims target_fps but only real_fps frames were captured,
+        # producing a short / sped-up video that desyncs from real-time audio.
+        real_fps = max(1.0, self._real_fps or float(self.config.fps))
+        target_fps = float(self.config.fps)
+
+        cmd = [ffmpeg, "-y", "-r", f"{real_fps:.3f}", "-i", self._video_tmp]
         if has_audio:
             cmd += ["-i", self._audio_tmp]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
             "-pix_fmt", "yuv420p",
+            "-vf", f"fps={target_fps}",  # smooth output to a constant frame rate
         ]
         if has_audio:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
         cmd += [out]
 
         try:
